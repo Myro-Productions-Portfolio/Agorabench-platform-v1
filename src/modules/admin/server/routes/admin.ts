@@ -153,6 +153,21 @@ router.get('/admin/config', requireOwner, (_req, res) => {
   res.json({ success: true, data: getRuntimeConfig() });
 });
 
+/* Internal inference targets — served only through this owner-gated endpoint
+   so LAN addresses never ship in the public client bundle. */
+const INFERENCE_PRESETS: Array<{ label: string; url: string; model?: string }> = [
+  { label: 'Gemma-4-31B (spark1)', url: 'http://10.0.0.69:1234/v1', model: 'gemma-4-31b' },
+  { label: 'Qwen3.8-27B (spark2)', url: 'http://10.0.0.169:8000/v1', model: 'qwen3.8-27b' },
+];
+
+/* GET /api/admin/inference-presets — internal inference targets (owner only) */
+router.get('/admin/inference-presets', requireOwner, (_req, res) => {
+  res.json({
+    success: true,
+    data: { presets: INFERENCE_PRESETS.map(({ label, url, model }) => ({ label, url, model })) },
+  });
+});
+
 /* POST /api/admin/config — update runtime configuration (owner only) */
 router.post('/admin/config', requireOwner, async (req, res, next) => {
   try {

@@ -246,6 +246,7 @@ export const adminApi = {
   getConfig: () => request('/admin/config'),
   setConfig: (data: Record<string, unknown>) =>
     request('/admin/config', { method: 'POST', body: JSON.stringify(data) }),
+  getInferencePresets: () => request('/admin/inference-presets'),
   getAgents: () => request('/admin/agents'),
   toggleAgent: (id: string) =>
     request(`/admin/agents/${id}/toggle`, { method: 'POST' }),
