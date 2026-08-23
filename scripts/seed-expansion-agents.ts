@@ -1,181 +1,307 @@
 /**
- * Expansion seed: adds 20 new agents to bring the simulation from 10 → 30.
+ * Staged agent-pool expansion: inserts NEW agents (20 personas, 4 per alignment)
+ * in offset windows, with party memberships, at the LIVE initialAgentBalance.
  *
- * Mirrors the shape of scripts/add-political-agents.ts but:
- * - modelProvider='openai' so everyone routes through the rc.providerOverride
- *   path to bspark2 vLLM (Qwen/Qwen2.5-32B-Instruct-GPTQ-Int8), not ollama
- * - model='' so the fallback chain picks up rc.simInferenceModel / env var
- * - Inserts party_memberships rows in the same run, auto-assigning the party
- *   that matches each agent's alignment (1:1 alignment→party mapping in the
- *   current seed)
- * - 4 new agents per alignment, balanced across all 5 parties
- * - Safe to run on a live DB: does NOT truncate, only inserts. Refuses to run
- *   if any of the new agent names already exist (prevents duplicate key
- *   crash on agents_name_unique).
+ * - Dry-run by default: prints the full insertion plan (resolved inference
+ *   model + its source, balance + its source, party mapping, every row) and
+ *   writes nothing. Pass --execute to insert.
+ * - Aborts BEFORE any insert if runtime_config cannot be read from the DB
+ *   (loadRuntimeConfig fails soft — this script refuses to seed off defaults
+ *   it cannot distinguish from a dead DB), or if any alignment maps to 0 or
+ *   >1 active parties.
+ * - Idempotent / resume-safe: a name that already exists is skipped with a
+ *   log, but its party membership is still guarded+inserted, so a crash
+ *   between agent insert and membership insert self-heals on re-run. Repair
+ *   only adopts rows carrying this script's deterministic `agora_<name>`
+ *   agoraId — a same-named agent from any other creation path is a loud
+ *   CONFLICT and is left completely untouched.
+ * - New rows: model NULL (inherits via ai.ts getDefaultModel — '' never
+ *   inherits), modelProvider 'openai', reputation 100, approvalRating 50.
  *
- * Run on the Linux box:
- *   cd /home/myroproductions/Projects/AgoraBench && \
- *   NODE_ENV=production npx tsx scripts/seed-expansion-agents.ts
+ * Usage (on the Linux box):
+ *   npx tsx scripts/seed-expansion-agents.ts                         # dry-run, full batch
+ *   npx tsx scripts/seed-expansion-agents.ts --count 10 --offset 0   # dry-run wave 1
+ *   npx tsx scripts/seed-expansion-agents.ts --count 10 --offset 0 --execute
+ *   npx tsx scripts/seed-expansion-agents.ts --count 10 --offset 10 --execute
  */
 
 import 'dotenv/config';
-import { eq, inArray, sql } from 'drizzle-orm';
-import { db } from '../src/core/db/connection.js';
+import { and, eq, inArray, sql } from 'drizzle-orm';
+import { db, queryClient } from '../src/core/db/connection.js';
 import {
   agents,
+  apiProviders,
   parties,
   partyMemberships,
+  runtimeConfigStore,
 } from '../src/core/db/schema/index.js';
+import { loadRuntimeConfig } from '../src/core/server/runtimeConfig.js';
+import {
+  ALIGNMENTS,
+  PERSONAS,
+  RESERVED_NAMES,
+  balanceSourceOf,
+  buildAgentRow,
+  expectedAgoraId,
+  isForeignAgent,
+  mapAlignmentsToParties,
+  partitionByExisting,
+  planWave,
+  resolveOpenAiModel,
+  validatePersonas,
+  type ActivePartyRow,
+  type Alignment,
+} from './lib/expansionPlan.js';
 
-type Alignment = 'progressive' | 'moderate' | 'conservative' | 'libertarian' | 'technocrat';
-
-interface NewAgentDef {
-  name: string;
-  displayName: string;
-  alignment: Alignment;
-  personality: string;
-  reputation: number;
-  balance: number;
+interface CliArgs {
+  count: number;
+  offset: number;
+  execute: boolean;
 }
 
-const NEW_AGENTS: NewAgentDef[] = [
-  /* ---- Progressive (4) ---- */
-  { name: 'cal-brennan',    displayName: 'Cal Brennan',    alignment: 'progressive', personality: 'A community organizer turned legislator who grounds every bill in street-level reality', reputation: 390, balance: 1500 },
-  { name: 'petra-walsh',    displayName: 'Petra Walsh',    alignment: 'progressive', personality: 'A labor attorney who sees every economic policy through the lens of who bears the risk', reputation: 370, balance: 1450 },
-  { name: 'miko-tanaka',    displayName: 'Miko Tanaka',    alignment: 'progressive', personality: 'An educator who measures every policy by its effect on the next generation', reputation: 420, balance: 1650 },
-  { name: 'amari-jones',    displayName: 'Amari Jones',    alignment: 'progressive', personality: 'A civil rights lawyer who treats incremental reform as a form of quiet surrender', reputation: 450, balance: 1750 },
+function parseArgs(argv: string[]): CliArgs {
+  let count = PERSONAS.length;
+  let offset = 0;
+  let execute = false;
 
-  /* ---- Moderate (4) ---- */
-  { name: 'mae-donovan',    displayName: 'Mae Donovan',    alignment: 'moderate', personality: 'A former journalist who treats every policy debate as a story with two legitimate sides', reputation: 460, balance: 1850 },
-  { name: 'lena-vasquez',   displayName: 'Lena Vasquez',   alignment: 'moderate', personality: 'A two-term mayor who learned that nothing gets done without building the coalition first', reputation: 510, balance: 2050 },
-  { name: 'desmond-park',   displayName: 'Desmond Park',   alignment: 'moderate', personality: 'A hospital administrator who trusts institutions more than revolutions', reputation: 480, balance: 1950 },
-  { name: 'ingrid-halvor',  displayName: 'Ingrid Halvor',  alignment: 'moderate', personality: 'A diplomat whose first instinct in any conflict is to find the seam where both sides can save face', reputation: 430, balance: 1700 },
-
-  /* ---- Conservative (4) ---- */
-  { name: 'tess-harlow',    displayName: 'Tess Harlow',    alignment: 'conservative', personality: 'A fiscal hawk who believes the national debt is the defining moral issue of our generation', reputation: 420, balance: 1700 },
-  { name: 'knox-aldridge',  displayName: 'Knox Aldridge',  alignment: 'conservative', personality: 'A rancher-turned-senator who distrusts anything decided too far from the county line', reputation: 490, balance: 2000 },
-  { name: 'walter-pruitt',  displayName: 'Walter Pruitt',  alignment: 'conservative', personality: 'A retired judge who holds that the rule of law is worth more than any single policy outcome', reputation: 540, balance: 2150 },
-  { name: 'cora-beckett',   displayName: 'Cora Beckett',   alignment: 'conservative', personality: 'A small-business owner who believes the burden of proof should always rest on new regulation, never old freedom', reputation: 380, balance: 1500 },
-
-  /* ---- Libertarian (4) ---- */
-  { name: 'rio-castillo',   displayName: 'Rio Castillo',   alignment: 'libertarian', personality: 'Deeply skeptical of both parties, he votes on principle even when it costs him allies', reputation: 310, balance: 1100 },
-  { name: 'soren-pike',     displayName: 'Soren Pike',     alignment: 'libertarian', personality: 'An ex-cryptographer who sees surveillance in every government program', reputation: 340, balance: 1300 },
-  { name: 'juno-ashworth',  displayName: 'Juno Ashworth',  alignment: 'libertarian', personality: 'A homesteader who measures freedom by what she can build without asking permission', reputation: 360, balance: 1400 },
-  { name: 'eliot-ward',     displayName: 'Eliot Ward',     alignment: 'libertarian', personality: 'A constitutional scholar who treats every expansion of state power as a debt the next generation will pay', reputation: 400, balance: 1550 },
-
-  /* ---- Technocrat (4) ---- */
-  { name: 'ezra-cole',      displayName: 'Ezra Cole',      alignment: 'technocrat', personality: 'He believes the public sector is just a startup that forgot to iterate', reputation: 530, balance: 2100 },
-  { name: 'idris-osei',     displayName: 'Idris Osei',     alignment: 'technocrat', personality: 'A climate systems modeler who believes all policy debates are really resource allocation problems', reputation: 440, balance: 1750 },
-  { name: 'yuki-sato',      displayName: 'Yuki Sato',      alignment: 'technocrat', personality: 'A former central banker who believes every political instinct should be audited against the numbers', reputation: 570, balance: 2250 },
-  { name: 'hannah-beier',   displayName: 'Hannah Beier',   alignment: 'technocrat', personality: 'A systems engineer who treats legislation as an API: inputs, outputs, error handling, no magic', reputation: 410, balance: 1650 },
-];
-
-async function main(): Promise<void> {
-  console.log(`[EXPAND] Preparing to insert ${NEW_AGENTS.length} new agents...`);
-
-  /* Pre-flight: refuse to run if any of these names already exist */
-  const newNames = NEW_AGENTS.map((a) => a.name);
-  const existing = await db
-    .select({ name: agents.name })
-    .from(agents)
-    .where(inArray(agents.name, newNames));
-  if (existing.length > 0) {
-    console.error(`[EXPAND] REFUSING to insert — ${existing.length} of the new agent names already exist:`);
-    existing.forEach((e) => console.error(`  - ${e.name}`));
-    console.error('[EXPAND] Either remove those rows first, or edit this script to use different names.');
-    process.exit(1);
-  }
-
-  /* Load party id for each alignment */
-  console.log('[EXPAND] Loading existing parties...');
-  const allParties = await db.select({ id: parties.id, alignment: parties.alignment }).from(parties);
-  const partyByAlignment = new Map<string, string>();
-  for (const p of allParties) {
-    if (p.alignment) partyByAlignment.set(p.alignment, p.id);
-  }
-
-  const requiredAlignments: Alignment[] = ['progressive', 'moderate', 'conservative', 'libertarian', 'technocrat'];
-  for (const a of requiredAlignments) {
-    if (!partyByAlignment.has(a)) {
-      console.error(`[EXPAND] REFUSING — no party found for alignment='${a}'. Existing parties:`, allParties);
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--execute') {
+      execute = true;
+    } else if (arg === '--count' || arg === '--offset') {
+      const raw = argv[i + 1];
+      const n = raw !== undefined ? Number.parseInt(raw, 10) : NaN;
+      const min = arg === '--count' ? 1 : 0;
+      if (!Number.isInteger(n) || n < min || String(n) !== raw) {
+        console.error(`[EXPAND] ${arg} requires an integer >= ${min}, got: ${raw}`);
+        process.exit(1);
+      }
+      if (arg === '--count') count = n;
+      else offset = n;
+      i++;
+    } else {
+      console.error(`[EXPAND] Unknown argument: ${arg}`);
+      console.error('[EXPAND] Usage: seed-expansion-agents.ts [--count N] [--offset M] [--execute]');
       process.exit(1);
     }
   }
 
-  /* Build insert rows */
-  const agentRows = NEW_AGENTS.map((a) => ({
-    agoraId: `agora_${a.name}`,
-    name: a.name,
-    displayName: a.displayName,
-    alignment: a.alignment,
-    modelProvider: 'openai', // routes through rc.providerOverride='openai' → bspark2 vLLM
-    model: '',               // fallback chain fills from rc.simInferenceModel / env
-    personality: a.personality,
-    reputation: a.reputation,
-    balance: a.balance,
-    isActive: true,
-    approvalRating: 50,
-  }));
+  return { count, offset, execute };
+}
 
-  console.log('[EXPAND] Inserting agents...');
-  const insertedAgents = await db.insert(agents).values(agentRows).returning({
-    id: agents.id,
-    name: agents.name,
-    displayName: agents.displayName,
-    alignment: agents.alignment,
-  });
-  console.log(`[EXPAND] ✓ Inserted ${insertedAgents.length} agents`);
+/* Sync on purpose: a `never` return lets TS narrow after every call site.
+   All aborts happen before any write — leaked sockets die with the process. */
+function abort(message: string, detail?: unknown): never {
+  console.error(`[EXPAND] ABORT — ${message}`);
+  if (detail !== undefined) console.error(detail);
+  process.exit(1);
+}
 
-  /* Build party_memberships rows — alignment → party id */
-  const membershipRows = insertedAgents.map((a) => {
-    const partyId = partyByAlignment.get(a.alignment ?? '');
-    if (!partyId) throw new Error(`No party for alignment ${a.alignment} (agent ${a.name})`);
-    return {
-      agentId: a.id,
-      partyId,
-      role: 'member' as const,
-    };
-  });
+const usd = (n: number) => `$${n.toLocaleString('en-US')}`;
 
-  console.log('[EXPAND] Inserting party memberships...');
-  const insertedMemberships = await db.insert(partyMemberships).values(membershipRows).returning({
-    id: partyMemberships.id,
-  });
-  console.log(`[EXPAND] ✓ Inserted ${insertedMemberships.length} party memberships`);
+async function main(): Promise<void> {
+  const { count, offset, execute } = parseArgs(process.argv.slice(2));
 
-  /* Increment parties.member_count (denormalized counter) */
-  console.log('[EXPAND] Incrementing party member_count...');
-  const countsByParty = new Map<string, number>();
-  for (const row of membershipRows) {
-    countsByParty.set(row.partyId, (countsByParty.get(row.partyId) ?? 0) + 1);
+  const personaErrors = validatePersonas(PERSONAS, RESERVED_NAMES);
+  if (personaErrors.length > 0) {
+    abort('persona batch failed self-validation:', personaErrors);
   }
-  for (const [partyId, delta] of Array.from(countsByParty.entries())) {
+
+  const wave = planWave(PERSONAS, count, offset);
+  if (wave.length === 0) {
+    abort(`--count ${count} --offset ${offset} selects no personas (batch has ${PERSONAS.length}).`);
+  }
+
+  /* runtime_config probe: loadRuntimeConfig() fails soft on DB errors, so
+     read the row ourselves first — a throw here means the DB is unreachable
+     and seeding off silent defaults would be wrong. */
+  let configJson: Record<string, unknown> | null = null;
+  try {
+    const [row] = await db
+      .select({ config: runtimeConfigStore.config })
+      .from(runtimeConfigStore)
+      .where(eq(runtimeConfigStore.id, 1))
+      .limit(1);
+    configJson = (row?.config as Record<string, unknown> | undefined) ?? null;
+  } catch (err) {
+    abort(
+      'cannot read runtime_config from the DB. Refusing to fall back to code defaults — fix DATABASE_URL / start Postgres and re-run.',
+      err,
+    );
+  }
+
+  const rc = await loadRuntimeConfig();
+  const balanceSource = balanceSourceOf(configJson);
+  if (
+    balanceSource === 'runtime_config DB row' &&
+    rc.initialAgentBalance !== configJson?.initialAgentBalance
+  ) {
+    abort(
+      `runtime_config row says initialAgentBalance=${String(configJson?.initialAgentBalance)} but loadRuntimeConfig() returned ${rc.initialAgentBalance} — config load failed soft mid-run.`,
+    );
+  }
+  const balance = rc.initialAgentBalance;
+
+  /* Same lookup getDefaultModel does (ai.ts:798-826): active openai provider
+     row first, .catch → null. */
+  let providerDefaultModel: string | null = null;
+  try {
+    const [row] = await db
+      .select({ defaultModel: apiProviders.defaultModel })
+      .from(apiProviders)
+      .where(and(eq(apiProviders.providerName, 'openai'), eq(apiProviders.isActive, true)))
+      .limit(1);
+    providerDefaultModel = row?.defaultModel ?? null;
+  } catch {
+    providerDefaultModel = null;
+  }
+  const resolvedModel = resolveOpenAiModel({
+    providerDefaultModel,
+    simInferenceModel: rc.simInferenceModel,
+    envOpenAiModel: process.env.OPENAI_MODEL,
+  });
+
+  const activeParties: ActivePartyRow[] = await db
+    .select({ id: parties.id, name: parties.name, alignment: parties.alignment })
+    .from(parties)
+    .where(eq(parties.isActive, true));
+  const partyMap = mapAlignmentsToParties(activeParties);
+  if (!partyMap.ok) {
+    abort('active-party mapping is not 1:1 — refusing to insert anything:', partyMap.errors);
+  }
+  const byAlignment = partyMap.byAlignment;
+
+  const waveNames = wave.map((p) => p.name);
+  const existingRows = await db
+    .select({ name: agents.name })
+    .from(agents)
+    .where(inArray(agents.name, waveNames));
+  const { toInsert, toRepair } = partitionByExisting(waveNames, existingRows.map((r) => r.name));
+
+  console.log(`[EXPAND] MODE: ${execute ? 'EXECUTE' : 'DRY RUN (pass --execute to write)'}`);
+  console.log(`[EXPAND] Wave: --count ${count} --offset ${offset} → ${wave.length} personas`);
+  console.log(`[EXPAND] Inference model newcomers inherit: ${resolvedModel.model} (source: ${resolvedModel.source})`);
+  console.log(`[EXPAND] initialAgentBalance: ${usd(balance)} (source: ${balanceSource})`);
+  console.log('[EXPAND] Party mapping (active parties):');
+  for (const a of ALIGNMENTS) {
+    const p = byAlignment.get(a as Alignment);
+    console.log(`  ${a.padEnd(12)} → ${p?.name} (${p?.id})`);
+  }
+  console.log(`[EXPAND] New inserts: ${toInsert.length} | already exist (membership repair only): ${toRepair.length === 0 ? 'none' : toRepair.join(', ')}`);
+  console.log('[EXPAND] Insertion plan:');
+  for (const [i, persona] of wave.entries()) {
+    const row = buildAgentRow(persona, balance);
+    const party = byAlignment.get(persona.alignment);
+    const marker = toRepair.includes(persona.name) ? 'REPAIR' : 'INSERT';
+    console.log(
+      `  [${String(offset + i + 1).padStart(2)}] ${marker} ${row.name.padEnd(17)} "${row.displayName}" ${row.alignment.padEnd(12)} → ${party?.name}`,
+    );
+    console.log(
+      `       agoraId=${row.agoraId} provider=${row.modelProvider} model=NULL(inherits) reputation=${row.reputation} approval=${row.approvalRating} balance=${usd(row.balance)} active=${row.isActive}`,
+    );
+    console.log(`       "${row.personality}"`);
+  }
+
+  if (!execute) {
+    console.log('[EXPAND] DRY RUN complete — nothing written.');
+    await queryClient.end({ timeout: 5 });
+    process.exit(0);
+  }
+
+  let insertedAgents = 0;
+  let skippedAgents = 0;
+  let foreignConflicts = 0;
+  let insertedMemberships = 0;
+  let skippedMemberships = 0;
+  const memberCountDelta = new Map<string, number>();
+  const repairSet = new Set(toRepair);
+
+  for (const persona of wave) {
+    const party = byAlignment.get(persona.alignment);
+    if (!party) throw new Error(`no party mapped for alignment '${persona.alignment}'`);
+
+    let agentId: string | null = null;
+    if (!repairSet.has(persona.name)) {
+      try {
+        const [ins] = await db
+          .insert(agents)
+          .values(buildAgentRow(persona, balance))
+          .returning({ id: agents.id });
+        agentId = ins.id;
+        insertedAgents++;
+        console.log(`[EXPAND] + agent ${persona.name} (${agentId})`);
+      } catch (err) {
+        // drizzle-orm >= 0.44 wraps driver errors in DrizzleQueryError (code moves to err.cause) — revisit on upgrade
+        if ((err as { code?: string }).code !== '23505') throw err;
+        // inserted by a concurrent/earlier run — fall through to repair
+      }
+    }
+    if (agentId === null) {
+      const [existing] = await db
+        .select({ id: agents.id, agoraId: agents.agoraId })
+        .from(agents)
+        .where(eq(agents.name, persona.name))
+        .limit(1);
+      if (!existing) throw new Error(`agent '${persona.name}' reported existing but not found on re-select`);
+      if (isForeignAgent(persona.name, existing.agoraId)) {
+        foreignConflicts++;
+        console.error(
+          `[EXPAND] ! CONFLICT ${persona.name}: existing agent has agoraId '${existing.agoraId}', expected '${expectedAgoraId(persona.name)}' — created by another path, leaving it untouched (no membership insert)`,
+        );
+        continue;
+      }
+      agentId = existing.id;
+      skippedAgents++;
+      console.log(`[EXPAND] = agent ${persona.name} already exists — checking membership`);
+    }
+
+    const [membership] = await db
+      .select({ id: partyMemberships.id, partyId: partyMemberships.partyId })
+      .from(partyMemberships)
+      .where(eq(partyMemberships.agentId, agentId))
+      .limit(1);
+    if (!membership) {
+      await db.insert(partyMemberships).values({ agentId, partyId: party.id, role: 'member' });
+      memberCountDelta.set(party.id, (memberCountDelta.get(party.id) ?? 0) + 1);
+      insertedMemberships++;
+      console.log(`[EXPAND]   + membership → ${party.name}`);
+    } else {
+      skippedMemberships++;
+      if (membership.partyId !== party.id) {
+        console.warn(
+          `[EXPAND]   ! membership present but in a DIFFERENT party (${membership.partyId}, expected ${party.id} ${party.name}) — left as-is`,
+        );
+      } else {
+        console.log(`[EXPAND]   = membership already present — skipped`);
+      }
+    }
+  }
+
+  for (const [partyId, delta] of memberCountDelta) {
     await db
       .update(parties)
       .set({ memberCount: sql`${parties.memberCount} + ${delta}` })
       .where(eq(parties.id, partyId));
   }
 
-  /* Summary */
-  console.log('\n[EXPAND] New agents by alignment:');
-  const byAlignment = new Map<string, string[]>();
-  for (const a of insertedAgents) {
-    const arr = byAlignment.get(a.alignment ?? '') ?? [];
-    arr.push(a.displayName);
-    byAlignment.set(a.alignment ?? '', arr);
-  }
-  for (const [alignment, names] of Array.from(byAlignment.entries())) {
-    console.log(`  ${alignment} (${names.length}): ${names.join(', ')}`);
-  }
+  const [{ total, active }] = await db
+    .select({
+      total: sql<number>`count(*)::int`,
+      active: sql<number>`count(*) filter (where ${agents.isActive})::int`,
+    })
+    .from(agents);
 
-  /* Final sanity check: total agent count */
-  const totalRows = await db.select({ id: agents.id }).from(agents);
-  console.log(`\n[EXPAND] Total agents in DB: ${totalRows.length}`);
+  console.log('[EXPAND] Done.');
+  console.log(`[EXPAND] Agents inserted: ${insertedAgents}, already existed: ${skippedAgents}${foreignConflicts > 0 ? `, FOREIGN-NAME CONFLICTS (untouched): ${foreignConflicts}` : ''}`);
+  console.log(`[EXPAND] Memberships inserted: ${insertedMemberships}, already present: ${skippedMemberships}`);
+  console.log(`[EXPAND] Agents in DB: ${total} total, ${active} active`);
 
+  await queryClient.end({ timeout: 5 });
   process.exit(0);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('[EXPAND] FAILED:', err);
+  await queryClient.end({ timeout: 5 }).catch(() => undefined);
   process.exit(1);
 });
