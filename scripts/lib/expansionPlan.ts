@@ -147,9 +147,21 @@ export function planWave(
   return orderRoundRobin(personas).slice(offset, offset + count);
 }
 
+/** Deterministic agoraId — the script's ownership marker. Other creation
+ *  paths differ (the admin route appends a timestamp: `agora_<name>_<ts>`). */
+export function expectedAgoraId(name: string): string {
+  return `agora_${name}`;
+}
+
+/** A name match whose agoraId is not the deterministic one belongs to some
+ *  other creation path — the repair pass must never adopt or party-enroll it. */
+export function isForeignAgent(name: string, agoraId: string): boolean {
+  return agoraId !== expectedAgoraId(name);
+}
+
 export function buildAgentRow(persona: PersonaDef, balance: number): PlannedAgentRow {
   return {
-    agoraId: `agora_${persona.name}`,
+    agoraId: expectedAgoraId(persona.name),
     name: persona.name,
     displayName: persona.displayName,
     alignment: persona.alignment,

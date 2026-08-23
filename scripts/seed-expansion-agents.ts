@@ -11,7 +11,10 @@
  *   >1 active parties.
  * - Idempotent / resume-safe: a name that already exists is skipped with a
  *   log, but its party membership is still guarded+inserted, so a crash
- *   between agent insert and membership insert self-heals on re-run.
+ *   between agent insert and membership insert self-heals on re-run. Repair
+ *   only adopts rows carrying this script's deterministic `agora_<name>`
+ *   agoraId — a same-named agent from any other creation path is a loud
+ *   CONFLICT and is left completely untouched.
  * - New rows: model NULL (inherits via ai.ts getDefaultModel — '' never
  *   inherits), modelProvider 'openai', reputation 100, approvalRating 50.
  *
@@ -39,6 +42,8 @@ import {
   RESERVED_NAMES,
   balanceSourceOf,
   buildAgentRow,
+  expectedAgoraId,
+  isForeignAgent,
   mapAlignmentsToParties,
   partitionByExisting,
   planWave,
@@ -205,6 +210,7 @@ async function main(): Promise<void> {
 
   let insertedAgents = 0;
   let skippedAgents = 0;
+  let foreignConflicts = 0;
   let insertedMemberships = 0;
   let skippedMemberships = 0;
   const memberCountDelta = new Map<string, number>();
@@ -225,35 +231,49 @@ async function main(): Promise<void> {
         insertedAgents++;
         console.log(`[EXPAND] + agent ${persona.name} (${agentId})`);
       } catch (err) {
+        // drizzle-orm >= 0.44 wraps driver errors in DrizzleQueryError (code moves to err.cause) — revisit on upgrade
         if ((err as { code?: string }).code !== '23505') throw err;
         // inserted by a concurrent/earlier run — fall through to repair
       }
     }
     if (agentId === null) {
       const [existing] = await db
-        .select({ id: agents.id })
+        .select({ id: agents.id, agoraId: agents.agoraId })
         .from(agents)
         .where(eq(agents.name, persona.name))
         .limit(1);
       if (!existing) throw new Error(`agent '${persona.name}' reported existing but not found on re-select`);
+      if (isForeignAgent(persona.name, existing.agoraId)) {
+        foreignConflicts++;
+        console.error(
+          `[EXPAND] ! CONFLICT ${persona.name}: existing agent has agoraId '${existing.agoraId}', expected '${expectedAgoraId(persona.name)}' — created by another path, leaving it untouched (no membership insert)`,
+        );
+        continue;
+      }
       agentId = existing.id;
       skippedAgents++;
       console.log(`[EXPAND] = agent ${persona.name} already exists — checking membership`);
     }
 
-    const membership = await db
-      .select({ id: partyMemberships.id })
+    const [membership] = await db
+      .select({ id: partyMemberships.id, partyId: partyMemberships.partyId })
       .from(partyMemberships)
       .where(eq(partyMemberships.agentId, agentId))
       .limit(1);
-    if (membership.length === 0) {
+    if (!membership) {
       await db.insert(partyMemberships).values({ agentId, partyId: party.id, role: 'member' });
       memberCountDelta.set(party.id, (memberCountDelta.get(party.id) ?? 0) + 1);
       insertedMemberships++;
       console.log(`[EXPAND]   + membership → ${party.name}`);
     } else {
       skippedMemberships++;
-      console.log(`[EXPAND]   = membership already present — skipped`);
+      if (membership.partyId !== party.id) {
+        console.warn(
+          `[EXPAND]   ! membership present but in a DIFFERENT party (${membership.partyId}, expected ${party.id} ${party.name}) — left as-is`,
+        );
+      } else {
+        console.log(`[EXPAND]   = membership already present — skipped`);
+      }
     }
   }
 
@@ -272,7 +292,7 @@ async function main(): Promise<void> {
     .from(agents);
 
   console.log('[EXPAND] Done.');
-  console.log(`[EXPAND] Agents inserted: ${insertedAgents}, already existed: ${skippedAgents}`);
+  console.log(`[EXPAND] Agents inserted: ${insertedAgents}, already existed: ${skippedAgents}${foreignConflicts > 0 ? `, FOREIGN-NAME CONFLICTS (untouched): ${foreignConflicts}` : ''}`);
   console.log(`[EXPAND] Memberships inserted: ${insertedMemberships}, already present: ${skippedMemberships}`);
   console.log(`[EXPAND] Agents in DB: ${total} total, ${active} active`);
 

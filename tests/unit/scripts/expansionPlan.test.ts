@@ -9,6 +9,8 @@ import {
   orderRoundRobin,
   planWave,
   buildAgentRow,
+  expectedAgoraId,
+  isForeignAgent,
   mapAlignmentsToParties,
   partitionByExisting,
   resolveOpenAiModel,
@@ -132,6 +134,25 @@ describe('buildAgentRow', () => {
 
   it('leaves model undefined (NULL), never empty string', () => {
     expect(buildAgentRow(PERSONAS[0], 1).model).toBeUndefined();
+  });
+
+  it('uses the deterministic agoraId shared with the repair discriminator', () => {
+    expect(buildAgentRow(PERSONAS[0], 1).agoraId).toBe(expectedAgoraId(PERSONAS[0].name));
+  });
+});
+
+describe('isForeignAgent (repair-path discriminator)', () => {
+  it('accepts a row carrying the deterministic script agoraId', () => {
+    expect(isForeignAgent('odessa-reyes', 'agora_odessa-reyes')).toBe(false);
+  });
+
+  it('flags admin-route rows (timestamp-suffixed agoraId) as foreign', () => {
+    expect(isForeignAgent('odessa-reyes', 'agora_odessa-reyes_1787168032062')).toBe(true);
+  });
+
+  it('flags any other agoraId shape as foreign', () => {
+    expect(isForeignAgent('odessa-reyes', 'agora_someone-else')).toBe(true);
+    expect(isForeignAgent('odessa-reyes', '')).toBe(true);
   });
 });
 
