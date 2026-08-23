@@ -15,13 +15,20 @@ import type { IconProps } from '@core/client/components/icons';
 type AdminTab = 'overview' | 'simulation' | 'government' | 'agents' | 'providers' | 'access' | 'users' | 'database' | 'experiments' | 'agge' | 'weights' | 'health';
 
 /* Internal inference hosts are configured via the URL field / env var, not
-   shipped as presets — keep internal addresses out of the public bundle. */
+   shipped as presets — keep internal addresses out of the public bundle.
+   (Owner-gated internal presets are fetched at runtime; see fetchInferencePresets.) */
 const URL_PRESETS = [
   { label: 'Local vLLM', url: 'http://localhost:8000/v1' },
   { label: 'OpenRouter', url: 'https://openrouter.ai/api/v1' },
   { label: 'Anthropic', url: 'https://api.anthropic.com/v1' },
   { label: 'OpenAI', url: 'https://api.openai.com/v1' },
 ] as const;
+
+interface InferencePreset {
+  label: string;
+  url: string;
+  model?: string;
+}
 
 interface ResearcherRequest {
   id: string;
@@ -793,6 +800,10 @@ export function AdminPage() {
   const [aggeModels, setAggeModels] = useState<string[]>([]);
   const [aggeModelsFailed, setAggeModelsFailed] = useState(false);
 
+  /* Internal presets from the owner-gated endpoint; empty for non-owners/offline */
+  const [inferencePresets, setInferencePresets] = useState<InferencePreset[]>([]);
+  const allUrlPresets: InferencePreset[] = [...URL_PRESETS, ...inferencePresets];
+
   /* Active elections state */
   interface ActiveElection {
     id: string;
@@ -884,6 +895,16 @@ export function AdminPage() {
       const res = await adminApi.getConfig();
       setSimConfig(res.data as RuntimeConfig);
     } catch (err) { console.error('[ADMIN] fetchConfig failed:', err); }
+  }, []);
+
+  /* Internal addresses arrive only via the authenticated admin response, never
+     the bundle. Failure-soft: non-owner/offline just keeps the static presets. */
+  const fetchInferencePresets = useCallback(async () => {
+    try {
+      const res = await adminApi.getInferencePresets();
+      const presets = (res.data as { presets?: InferencePreset[] } | undefined)?.presets;
+      if (Array.isArray(presets)) setInferencePresets(presets);
+    } catch { /* failure-soft */ }
   }, []);
 
   const fetchEconomy = useCallback(async () => {
@@ -1040,6 +1061,7 @@ export function AdminPage() {
     void fetchStatus();
     void fetchDecisions();
     void fetchConfig();
+    void fetchInferencePresets();
     void fetchEconomy();
     void fetchBudgetStatus();
     void fetchAgents();
@@ -1160,7 +1182,7 @@ export function AdminPage() {
       }),
     ];
     return () => { unsubs.forEach((fn) => fn()); clearInterval(clockInterval); clearInterval(activityInterval); clearInterval(configInterval); };
-  }, [fetchStatus, fetchDecisions, fetchConfig, fetchEconomy, fetchBudgetStatus, fetchAgents, fetchAvatarAgents, fetchProviders, subscribe, fetchUsers, fetchResearcherRequests, fetchExportCounts, fetchActivityFeed, fetchBillPipeline, fetchActiveElections, fetchAggeInterventions, fetchSimModels, fetchAggeModels, fetchHealth]);
+  }, [fetchStatus, fetchDecisions, fetchConfig, fetchInferencePresets, fetchEconomy, fetchBudgetStatus, fetchAgents, fetchAvatarAgents, fetchProviders, subscribe, fetchUsers, fetchResearcherRequests, fetchExportCounts, fetchActivityFeed, fetchBillPipeline, fetchActiveElections, fetchAggeInterventions, fetchSimModels, fetchAggeModels, fetchHealth]);
 
   const flash = (msg: string) => {
     setActionMsg(msg);
@@ -1721,17 +1743,18 @@ export function AdminPage() {
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-text-secondary">Inference URL</label>
                     <select
-                      value={URL_PRESETS.find((p) => p.url === simConfig.simInferenceUrl)?.url ?? 'custom'}
+                      value={allUrlPresets.find((p) => p.url === simConfig.simInferenceUrl)?.url ?? 'custom'}
                       onChange={(e) => {
-                        const preset = URL_PRESETS.find((p) => p.url === e.target.value);
+                        const preset = allUrlPresets.find((p) => p.url === e.target.value);
                         const newUrl = preset ? preset.url : '';
-                        setSimConfig((c) => c ? { ...c, simInferenceUrl: newUrl } : c);
-                        void saveConfig({ simInferenceUrl: newUrl });
+                        const modelPatch = preset?.model ? { simInferenceModel: preset.model } : {};
+                        setSimConfig((c) => c ? { ...c, simInferenceUrl: newUrl, ...modelPatch } : c);
+                        void saveConfig({ simInferenceUrl: newUrl, ...modelPatch });
                         void fetchSimModels(newUrl || undefined);
                       }}
                       className="w-full bg-white/5 border border-border rounded px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-gold/50"
                     >
-                      {URL_PRESETS.map((p) => (
+                      {allUrlPresets.map((p) => (
                         <option key={p.url} value={p.url} className="bg-surface">{p.label}</option>
                       ))}
                       <option value="custom" className="bg-surface">Custom</option>
@@ -4697,17 +4720,18 @@ export function AdminPage() {
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-text-secondary">Inference URL</label>
                     <select
-                      value={URL_PRESETS.find((p) => p.url === simConfig.aggeInferenceUrl)?.url ?? 'custom'}
+                      value={allUrlPresets.find((p) => p.url === simConfig.aggeInferenceUrl)?.url ?? 'custom'}
                       onChange={(e) => {
-                        const preset = URL_PRESETS.find((p) => p.url === e.target.value);
+                        const preset = allUrlPresets.find((p) => p.url === e.target.value);
                         const newUrl = preset ? preset.url : '';
-                        setSimConfig((c) => c ? { ...c, aggeInferenceUrl: newUrl } : c);
-                        void saveConfig({ aggeInferenceUrl: newUrl });
+                        const modelPatch = preset?.model ? { aggeInferenceModel: preset.model } : {};
+                        setSimConfig((c) => c ? { ...c, aggeInferenceUrl: newUrl, ...modelPatch } : c);
+                        void saveConfig({ aggeInferenceUrl: newUrl, ...modelPatch });
                         void fetchAggeModels(newUrl || undefined);
                       }}
                       className="w-full bg-white/5 border border-border rounded px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-gold/50"
                     >
-                      {URL_PRESETS.map((p) => (
+                      {allUrlPresets.map((p) => (
                         <option key={p.url} value={p.url} className="bg-surface">{p.label}</option>
                       ))}
                       <option value="custom" className="bg-surface">Custom</option>
